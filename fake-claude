@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""fake-claude: pick how many fake Claude Code terminals to open, then open them as one Ghostty grid.
+
+  fake-claude      choose with the arrow keys
+  fake-claude N    skip the picker and open N (1-64)
+
+The terminals run fakeclaude, which is scripted: no API, no tokens.
+"""
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import termios
+import tty
+
+HERE = os.path.dirname(os.path.realpath(__file__))  # works through the symlink install.sh makes
+GRID = os.path.join(HERE, "grid.applescript")
+FAKE = os.path.join(HERE, "fakeclaude")
+# (terminals, columns): layouts that fill the screen without gaps
+LAYOUTS = [(1, 1), (2, 2), (3, 3), (4, 2), (6, 3), (8, 4), (9, 3), (12, 4), (16, 4), (20, 5), (24, 6),
+           (32, 8), (40, 8), (48, 8), (64, 8)]
+START = 4  # 6 terminals
+
+ORANGE, GREY = "\x1b[38;2;215;119;87m", "\x1b[38;2;153;153;153m"
+BOLD, DIM, R = "\x1b[1m", "\x1b[2m", "\x1b[0m"
+PW, PH = 40, 12  # preview size in characters; half blocks give two pixels per character row
+
+
+def rows_for(n, cols):
+    return -(-n // cols)
+
+
+def per_column(n, cols):
+    return [n // cols + (1 if c < n % cols else 0) for c in range(cols)]
+
+
+def preview(n, cols):
+    px = [[False] * PW for _ in range(PH * 2)]
+    for c, k in enumerate(per_column(n, cols)):
+        x0, x1 = round(c * PW / cols), round((c + 1) * PW / cols) - 1  # stop 1 pixel short: the gap
+        for r in range(k):
+            y0, y1 = round(r * PH * 2 / k), round((r + 1) * PH * 2 / k) - 1
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    px[y][x] = True
+    blocks = {(True, True): "█", (True, False): "▀", (False, True): "▄", (False, False): " "}
+    return [ORANGE + "".join(blocks[px[2 * j][x], px[2 * j + 1][x]] for x in range(PW)) + R for j in range(PH)]
+
+
+def pick():
+    fd, out = sys.stdin.fileno(), sys.stdout
+    sel = START
+    term = shutil.get_terminal_size()
+    visible = max(3, min(len(LAYOUTS), term.lines - 6))
+    show_preview = term.columns >= 64 and term.lines >= PH + 8  # a wrapped or scrolled picker can't redraw in place
+    body = max(visible, PH + 2) if show_preview else visible
+    height = 3 + body + 2
+
+    def draw(first):
+        top = min(max(0, sel - visible // 2), len(LAYOUTS) - visible)
+        n, cols = LAYOUTS[sel]
+        right = []
+        if show_preview:
+            right = preview(n, cols) + ["", f"{GREY}{n} terminal{'s' * (n > 1)} · {cols} × {rows_for(n, cols)} grid{R}"]
+        lines = ["", f" {ORANGE}✻{R} {BOLD}How many fake Claude terminals?{R}", ""]
+        for i in range(body):
+            left = " " * 20
+            if i < visible:
+                j = top + i
+                cn, cc = LAYOUTS[j]
+                plain = f"  {'❯' if j == sel else ' '}{cn:>3}   {cc} × {rows_for(cn, cc)}".ljust(20)
+                left = (ORANGE + BOLD if j == sel else GREY) + plain + R
+            lines.append(left + "  " + (right[i] if i < len(right) else ""))
+        lines += ["", f"   {DIM}↑↓ choose · enter open · esc cancel{R}"]
+        out.write(("" if first else f"\x1b[{height}A") + "".join(f"\r\x1b[2K{l}\n" for l in lines))
+        out.flush()
+
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        out.write("\x1b[?25l")
+        draw(True)
+        while True:
+            key = os.read(fd, 64)
+            if key in (b"\x1b", b"q"):
+                return None
+            if key[:1] in (b"\r", b"\n", b" "):
+                return LAYOUTS[sel]
+            # a held arrow key can deliver several presses in one read
+            down = key.count(b"\x1b[B") + key.count(b"\x1bOB") + key.count(b"j")
+            up = key.count(b"\x1b[A") + key.count(b"\x1bOA") + key.count(b"k")
+            if down != up:
+                sel = min(len(LAYOUTS) - 1, max(0, sel + down - up))
+                draw(False)
+    except KeyboardInterrupt:
+        return None
+    finally:
+        out.write(f"\x1b[{height}A\x1b[J\x1b[?25h")  # erase the picker
+        out.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    if args:
+        n = int(args[0]) if args[0].isdigit() else 0
+        if not 1 <= n <= 64:
+            sys.exit("fake-claude: pick a number from 1 to 64")
+        choice = (n, dict(LAYOUTS).get(n))
+    elif sys.stdin.isatty():
+        choice = pick()
+        if not choice:
+            return
+    else:
+        sys.exit("fake-claude: run it in a terminal, or pass a number: fake-claude 12")
+
+    if not any(os.path.isdir(os.path.expanduser(p)) for p in ("/Applications/Ghostty.app", "~/Applications/Ghostty.app")):
+        sys.exit("fake-claude: needs the Ghostty terminal, 1.3 or later (brew install --cask ghostty)")
+    n, cols = choice
+    shape = f" ({cols} × {rows_for(n, cols)})" if cols else ""
+    what = f"{n} fake Claude terminal{'s' * (n > 1)}{shape}"
+    print(f" {ORANGE}✻{R} Opening {what}…", end="", flush=True)
+    cmd = (["osascript", GRID, "--fake-cmd", shlex.quote(FAKE), "--count", str(n)]
+           + (["--cols", str(cols)] if cols else []))
+    if subprocess.run(cmd, stdout=subprocess.DEVNULL).returncode == 0:
+        print(f"\r\x1b[2K {ORANGE}✻{R} Opened {what} in Ghostty.")
+    else:
+        print()
+        sys.exit("fake-claude: couldn't open the Ghostty grid")
+
+
+if __name__ == "__main__":
+    main()

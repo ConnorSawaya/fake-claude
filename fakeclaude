@@ -1,0 +1,989 @@
+#!/usr/bin/env python3
+"""fakeclaude: a pretend Claude Code session, for show.
+
+Everything is scripted and runs locally: no network, no API calls, no tokens.
+It draws Claude Code's screen and works through made-up tasks in a made-up project.
+
+  fakeclaude [--project N] [--manual]
+
+  --project N  pick the made-up project (0-35: six projects, each under six repo names); random if omitted
+  --manual     only work on prompts you type (by default it also invents its own)
+
+Type a prompt and press Enter and it "works" on it. Esc interrupts. Ctrl+C twice quits.
+
+Environment variables (all optional):
+  FAKECLAUDE_HOME     home folder shown in the header (default: yours); projects appear under <home>/code
+  FAKECLAUDE_MODEL    model name (default "Opus 5.5")
+  FAKECLAUDE_EFFORT   effort level (default "xhigh")
+  FAKECLAUDE_PLAN     plan name (default "Claude Max")
+  FAKECLAUDE_VERSION  version shown (default: your installed Claude Code's, else 2.1.310)
+  FAKECLAUDE_SPEED    pacing; 1.5 is twice as fast as the default 0.75
+"""
+import os
+import random
+import re
+import select
+import signal
+import sys
+import termios
+import textwrap
+import time
+import tty
+
+env = os.environ.get
+HOME = env("FAKECLAUDE_HOME") or os.path.expanduser("~")
+try:
+    # the native installer links ~/.local/bin/claude to .../versions/<version>
+    VERSION = os.path.basename(os.readlink(os.path.expanduser("~/.local/bin/claude")))
+except OSError:
+    VERSION = ""
+if not re.fullmatch(r"\d+\.\d+\.\d+", VERSION):
+    VERSION = "2.1.310"
+VERSION = env("FAKECLAUDE_VERSION") or VERSION
+MODEL = env("FAKECLAUDE_MODEL") or "Opus 5.5"
+EFFORT = env("FAKECLAUDE_EFFORT") or "xhigh"
+PLAN = env("FAKECLAUDE_PLAN") or "Claude Max"
+SPEED = float(env("FAKECLAUDE_SPEED") or "0.75")  # higher runs the script faster
+
+
+def fg(r, g, b):
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+
+def bg(r, g, b):
+    return f"\x1b[48;2;{r};{g};{b}m"
+
+
+R, BOLD, DIM, ITAL, STRIKE = "\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[3m", "\x1b[9m"
+ORANGE, ORANGE_HI = fg(215, 119, 87), fg(250, 180, 150)
+GREY, RULE, AMBER = fg(153, 153, 153), fg(136, 136, 136), fg(255, 193, 7)
+OK, ERR, CODE = fg(78, 186, 101), fg(255, 107, 128), fg(177, 185, 249)
+ADD_BG, DEL_BG, USER_BG = bg(34, 92, 43), bg(122, 41, 54), bg(55, 55, 55)
+NBSP = " "
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+VERBS = ["Accomplishing", "Baking", "Brewing", "Calculating", "Cerebrating", "Churning", "Clauding",
+         "Coalescing", "Cogitating", "Computing", "Conjuring", "Considering", "Cooking", "Crafting",
+         "Crunching", "Deliberating", "Finagling", "Forging", "Hatching", "Herding", "Honking",
+         "Hustling", "Ideating", "Inferring", "Manifesting", "Marinating", "Moseying", "Mulling",
+         "Mustering", "Musing", "Noodling", "Percolating", "Pondering", "Puttering", "Reticulating",
+         "Ruminating", "Schlepping", "Simmering", "Smooshing", "Spelunking", "Stewing",
+         "Synthesizing", "Tinkering", "Transmuting", "Vibing", "Whirring", "Wrangling"]
+PAST = ["Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched", "Sautéed", "Simmered", "Worked"]
+GLYPHS = "·✢✳✶✻✽✻✶✳✢"
+PLACEHOLDERS = ['Try "write a test for <filepath>"', 'Try "refactor <filepath>"',
+                'Try "how does <filepath> work?"', 'Try "fix lint errors"', 'Try "edit <filepath> to..."']
+INTROS = ["I'll start by looking at how this works today.", "Let me explore the relevant code first.",
+          "Let me take a look at the current implementation.",
+          "I'll dig into the codebase to see how this is set up.",
+          "Let me look at the existing code before changing anything."]
+LEADS = ["Done. Here's what changed:", "All done. Summary:", "Finished. Here's what changed:", "Done:"]
+GENERIC_TODOS = ["Explore the relevant code", "Make the change", "Add tests", "Run the test suite"]
+
+
+def T(prompt, title, grep, todos, find, diff, summary, fail=None):
+    # diff: (path, first line number, context before, removed, added, context after)
+    # fail: (test output, explanation, fix diff) for a first test run that fails
+    return dict(prompt=prompt, title=title, grep=grep, todos=todos, find=find,
+                diff=diff, summary=summary, fail=fail)
+
+
+PROJECTS = [
+    dict(
+        names=['payments-api', 'billing-service', 'checkout-svc', 'invoicing', 'payouts-api', 'subscriptions'], dir="src", branches=["main", "feat/idempotency", "fix/webhook-timeouts"],
+        files=["src/routes/checkout.ts", "src/services/stripe.ts", "src/db/orders.ts",
+               "src/routes/webhooks.ts", "src/lib/retry.ts"],
+        test="npm test -- --run",
+        passed=[" ✓ src/__tests__/orders.test.ts (12 tests) 184ms",
+                " ✓ src/__tests__/checkout.test.ts (19 tests) 402ms",
+                " ✓ src/__tests__/webhooks.test.ts (11 tests) 251ms",
+                " Test Files  3 passed (3)", "      Tests  42 passed (42)"],
+        test_tpl="src/__tests__/{slug}.test.ts",
+        preview=["import { describe, it, expect } from 'vitest';", "import request from 'supertest';",
+                 "import { app } from '../app';", ""],
+        tasks=[
+            T("add idempotency keys to the checkout endpoint so retries don't double charge",
+              "Checkout Idempotency Keys", "createOrder",
+              ["Explore checkout flow and order creation", "Add idempotency_keys table and lookup",
+               "Handle keys in POST /checkout", "Add tests for replayed and conflicting requests",
+               "Run the test suite"],
+              "Orders are created in `createOrder()` before the Stripe call, so a retried request creates "
+              "a second PaymentIntent. I'll store each key with a hash of the request body and replay the "
+              "saved response.",
+              ("src/routes/checkout.ts", 41, ["router.post('/checkout', auth, async (req, res) => {"], [],
+               ["  const key = req.header('Idempotency-Key');",
+                "  const existing = key && await findKey(key);",
+                "  if (existing) return replay(res, existing, req.body);"],
+               ["  const order = await createOrder(req.body);", "  const intent = await stripe.charge(order);"]),
+              ["Added an `idempotency_keys` table (key, body hash, status, response, expires_at)",
+               "`POST /checkout` replays the saved response for a repeated key and returns **409** if the "
+               "body changed",
+               "Keys expire after 24h and are swept by the existing nightly job", "Added 6 tests; all 48 pass"],
+              fail=([" ❯ src/__tests__/checkout.test.ts (19 tests | 1 failed) 398ms",
+                     "   × replays stored response for a repeated key", "     → expected 201 to be 200",
+                     " Test Files  1 failed | 2 passed (3)", "      Tests  1 failed | 47 passed (48)"],
+                    "One test fails: a replayed request returns **201** instead of **200**. The stored status "
+                    "code isn't restored, so I'll save it alongside the body.",
+                    ("src/routes/checkout.ts", 58, ["  if (existing) {"],
+                     ["    return res.json(existing.response);"],
+                     ["    return res", "      .status(existing.status)", "      .json(existing.response);"],
+                     ["  }"]))),
+            T("the stripe webhook handler is timing out under load, can you look into it",
+              "Webhook Timeouts", "fulfillOrder",
+              ["Trace the webhook handler path", "Ack events before doing work",
+               "Move fulfillment onto the job queue", "Run the test suite"],
+              "The handler awaits `fulfillOrder()`, which sends email and updates inventory, before returning "
+              "200. Under load that passes Stripe's 10s timeout and it retries, piling up more work. I'll "
+              "return 202 right after verifying the signature and queue the rest.",
+              ("src/routes/webhooks.ts", 27, ["  const event = verifySignature(req);"],
+               ["  await fulfillOrder(event.data.object);", "  res.sendStatus(200);"],
+               ["  res.sendStatus(202);", "  await queue.add('fulfill', {", "    eventId: event.id,",
+                "    orderId: event.data.object.metadata.orderId,", "  });"], []),
+              ["Webhook now responds **202** as soon as the signature checks out",
+               "Fulfillment runs on the `fulfill` job queue with 5 retries and backoff",
+               "Duplicate events are dropped using `event.id` as the job id", "All 42 tests pass"]),
+            T("refactor the stripe service to use a single shared client", "Stripe Client Refactor",
+              "new Stripe(",
+              ["Find every place a Stripe client is created", "Create a shared client in services/stripe.ts",
+               "Update callers to use it", "Run the test suite"],
+              "There are 4 separate `new Stripe(...)` calls, each with slightly different API versions and "
+              "timeouts. I'll make one configured client and import it everywhere.",
+              ("src/services/stripe.ts", 1, ["import Stripe from 'stripe';", "import { env } from '../env';", ""],
+               ["export const createClient = () => new Stripe(env.STRIPE_KEY);"],
+               ["export const stripe = new Stripe(env.STRIPE_KEY, {", "  apiVersion: '2026-09-30',",
+                "  maxNetworkRetries: 2,", "  timeout: 8_000,", "});"], []),
+              ["One shared `stripe` client in `src/services/stripe.ts` with a pinned API version",
+               "Removed 4 ad-hoc clients from routes and jobs",
+               "Network retries and an 8s timeout are now set in one place",
+               "No behavior changes; all 42 tests pass"]),
+        ]),
+    dict(
+        names=['ml-pipeline', 'churn-model', 'forecasting', 'recsys-train', 'fraud-detect', 'embeddings-etl'], dir="pipeline", branches=["main", "exp/early-stopping", "fix/dataloader-mem"],
+        files=["pipeline/train.py", "pipeline/dataset.py", "pipeline/features.py", "pipeline/eval.py",
+               "configs/base.yaml"],
+        test="uv run pytest",
+        passed=["tests/test_dataset.py ............  [ 21%]", "tests/test_features.py ..................  [ 53%]",
+                "tests/test_train.py ...............  [ 80%]", "tests/test_eval.py ...........  [100%]",
+                "============ 56 passed in 7.84s ============"],
+        test_tpl="tests/test_{snake}.py",
+        preview=["import numpy as np", "import pytest", "", "from pipeline import train"],
+        tasks=[
+            T("add early stopping to the training loop", "Early Stopping", "for epoch in",
+              ["Read the training loop and config", "Add EarlyStopping with patience and min_delta",
+               "Expose settings in configs/base.yaml", "Add tests", "Run the test suite"],
+              "The loop in `train()` always runs `cfg.epochs` and saves the last checkpoint, not the best "
+              "one. I'll track validation loss, keep the best weights, and stop after `patience` epochs "
+              "without improvement.",
+              ("pipeline/train.py", 88, ["    for epoch in range(cfg.epochs):",
+                                         "        train_loss = run_epoch(model, train_dl, opt)",
+                                         "        val_loss = evaluate(model, val_dl)"], [],
+               ["        if stopper.step(val_loss, model):",
+                "            log.info('early stop at epoch %d', epoch)", "            break"],
+               ["    stopper.restore_best(model)"]),
+              ["Added `EarlyStopping` (patience, min_delta) in `pipeline/train.py`",
+               "Best weights are restored when training stops, so the saved checkpoint is the best epoch",
+               "New `early_stopping:` block in `configs/base.yaml` (patience 5)", "Added 4 tests; 60 pass"]),
+            T("memory keeps growing every epoch during training, find the leak", "Training Memory Leak",
+              "loss_history",
+              ["Reproduce and measure memory per epoch", "Find what is holding references", "Fix the leak",
+               "Run the test suite"],
+              "`loss_history.append(loss)` stores the loss **tensor**, which keeps the whole autograd graph "
+              "alive for every batch. Storing `loss.item()` instead should flatten memory use.",
+              ("pipeline/train.py", 61, ["        opt.step()"], ["        loss_history.append(loss)"],
+               ["        loss_history.append(loss.item())"], ["        if step % cfg.log_every == 0:"]),
+              ["Root cause: losses were saved as tensors, keeping each batch's graph alive",
+               "Now stored as floats with `loss.item()`",
+               "Memory stays flat at ~3.1 GB across 20 epochs (was growing ~400 MB/epoch)",
+               "All 56 tests pass"]),
+            T("add a 7 day rolling average feature for daily_active_users", "Rolling DAU Feature",
+              "def build_features",
+              ["Look at how features are built", "Add rolling_mean helper", "Register dau_7d in build_features",
+               "Add tests", "Run the test suite"],
+              "Features are built in `build_features()` from a list of transforms. I'll add a `rolling_mean` "
+              "helper and register `dau_7d` with the others.",
+              ("pipeline/features.py", 52, ["def build_features(df):", "    out = df.copy()"], [],
+               ["    out['dau_7d'] = rolling_mean(out, 'daily_active_users')"],
+               ["    out['dow'] = out['date'].dt.dayofweek"]),
+              ["New `rolling_mean()` helper in `pipeline/features.py`", "`dau_7d` added to `build_features()`",
+               "Added tests for normal data and missing days", "60 tests pass"],
+              fail=(["tests/test_features.py ........F.........  [ 53%]",
+                     "FAILED tests/test_features.py::test_rolling_mean_gaps", "  AssertionError: assert nan == 4.5",
+                     "======= 1 failed, 59 passed in 7.61s ======="],
+                    "One failure: `rolling_mean` returns NaN when a day is missing. I'll reindex to a full "
+                    "daily range before rolling so gaps are handled.",
+                    ("pipeline/features.py", 34, ["def rolling_mean(df, col, days=7):"],
+                     ["    return df[col].rolling(days).mean()"],
+                     ["    s = df.set_index('date')[col].asfreq('D')",
+                      "    return s.rolling(days, min_periods=1).mean()"], []))),
+        ]),
+    dict(
+        names=['web-dashboard', 'admin-console', 'analytics-ui', 'ops-portal', 'growth-dash', 'status-page'], dir="src", branches=["main", "feat/dark-mode", "perf/overview"],
+        files=["src/components/Sidebar.tsx", "src/pages/Overview.tsx", "src/hooks/useMetrics.ts",
+               "src/components/MetricsChart.tsx", "src/styles/theme.css"],
+        test="npm run test -- --run",
+        passed=[" ✓ src/components/__tests__/Sidebar.test.tsx (8 tests) 96ms",
+                " ✓ src/components/__tests__/MetricsChart.test.tsx (14 tests) 211ms",
+                " ✓ src/hooks/__tests__/useMetrics.test.ts (9 tests) 143ms",
+                " Test Files  3 passed (3)", "      Tests  31 passed (31)"],
+        test_tpl="src/components/__tests__/{pascal}.test.tsx",
+        preview=["import { render, screen } from '@testing-library/react';",
+                 "import userEvent from '@testing-library/user-event';",
+                 "import { describe, it, expect } from 'vitest';", ""],
+        tasks=[
+            T("add a dark mode toggle to the sidebar", "Dark Mode Toggle", "data-theme",
+              ["Check how theme colors are defined", "Add dark palette to theme.css",
+               "Add toggle to Sidebar and persist choice", "Add tests", "Run the test suite"],
+              "Colors are already CSS variables in `theme.css`, so dark mode is mostly a second palette under "
+              "`[data-theme=dark]`. I'll add a toggle in the sidebar footer that sets the attribute and saves "
+              "the choice.",
+              ("src/components/Sidebar.tsx", 48, ['      <footer className="sidebar-footer">'], [],
+               ["        <button", '          aria-label="Toggle dark mode"',
+                "          onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}", "        >",
+                "          {theme === 'dark' ? <Sun /> : <Moon />}", "        </button>"],
+               ["        <UserMenu />"]),
+              ["Dark palette added under `[data-theme=dark]` in `theme.css`",
+               "Sun/moon toggle in the sidebar footer; choice saved to localStorage",
+               "Defaults to the system setting on first visit", "Added 3 tests; 34 pass"],
+              fail=([" ❯ src/components/__tests__/Sidebar.test.tsx (11 tests | 1 failed)",
+                     "   × remembers theme after reload", "     → expected 'light' to be 'dark'",
+                     " Test Files  1 failed | 2 passed (3)", "      Tests  1 failed | 33 passed (34)"],
+                    "One test fails because the theme is read from localStorage after the first render, so it "
+                    "flashes back to light. I'll read it in the state initializer instead.",
+                    ("src/components/Sidebar.tsx", 12, [], ["  const [theme, setTheme] = useState('light');"],
+                     ["  const [theme, setTheme] = useState(",
+                      "    () => localStorage.getItem('theme') ?? 'light'", "  );"], []))),
+            T("the overview page re-renders like crazy, can you fix the perf", "Overview Re-render Fix",
+              "useMetrics(",
+              ["Profile Overview renders", "Find unstable props and effects", "Memoize the expensive parts",
+               "Run the test suite"],
+              "`useMetrics()` gets a new `filters` object every render, which retriggers its effect, which sets "
+              "state, which re-renders. It loops about 30 times a second. I'll memoize the filters and the "
+              "derived chart data.",
+              ("src/pages/Overview.tsx", 19, ["export function Overview({ range }: Props) {"],
+               ["  const filters = { range, team: 'all' };"],
+               ["  const filters = useMemo(", "    () => ({ range, team: 'all' }),", "    [range]", "  );"],
+               ["  const { data } = useMetrics(filters);"]),
+              ["Root cause: a new `filters` object every render was retriggering `useMetrics`",
+               "Memoized `filters` and the chart series; `MetricsChart` wrapped in `memo`",
+               "Overview now renders twice on load instead of ~30 times a second", "All 31 tests pass"]),
+            T("make the sidebar collapsible on mobile", "Collapsible Mobile Sidebar", "<Sidebar",
+              ["Look at the layout and breakpoints", "Add a collapsed state and hamburger button",
+               "Close on navigation and backdrop tap", "Add tests", "Run the test suite"],
+              "The sidebar is always 260px wide, which pushes content off-screen under 768px. I'll turn it "
+              "into a slide-over drawer on small screens with a hamburger in the top bar.",
+              ("src/components/Sidebar.tsx", 22, ["  return ("], ['    <aside className="sidebar">'],
+               ["    <aside", "      className={cx('sidebar', open && 'sidebar--open')}",
+                "      aria-hidden={isMobile && !open}", "    >"], ["      <Logo />"]),
+              ["Sidebar is a slide-over drawer under 768px with a hamburger toggle",
+               "Closes on route change, backdrop tap and Esc", "Desktop layout unchanged",
+               "Added 4 tests; 35 pass"]),
+        ]),
+    dict(
+        names=['gateway', 'edge-proxy', 'api-router', 'ingress-svc', 'authz-proxy', 'mesh-gateway'], dir="internal", branches=["main", "feat/ratelimit", "fix/health-checks"],
+        files=["internal/proxy/handler.go", "internal/proxy/balancer.go", "internal/ratelimit/limiter.go",
+               "internal/config/config.go", "cmd/gateway/main.go"],
+        test="go test ./...",
+        passed=["ok   github.com/acme/{name}/internal/config     0.214s",
+                "ok   github.com/acme/{name}/internal/proxy      1.032s",
+                "ok   github.com/acme/{name}/internal/ratelimit  0.388s",
+                "?    github.com/acme/{name}/cmd/gateway         [no test files]"],
+        test_tpl="internal/proxy/{snake}_test.go",
+        preview=["package proxy", "", "import (", '\t"net/http/httptest"'],
+        tasks=[
+            T("add per-client rate limiting with a token bucket", "Per-client Rate Limiting",
+              "func (h *Handler) ServeHTTP",
+              ["Read the request path in the proxy handler", "Implement a token bucket keyed by client ID",
+               "Add limits to config", "Add tests", "Run the test suite"],
+              "Every request goes through `Handler.ServeHTTP`, and clients are identified by `X-Client-ID`. "
+              "I'll add a token bucket per client in `internal/ratelimit`, evicting idle buckets so memory "
+              "stays bounded.",
+              ("internal/proxy/handler.go", 37,
+               ["func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {",
+                '\tclient := r.Header.Get("X-Client-ID")'], [],
+               ["\tif !h.limiter.Allow(client) {", '\t\tw.Header().Set("Retry-After", "1")',
+                '\t\thttp.Error(w, "rate limited", http.StatusTooManyRequests)', "\t\treturn", "\t}"],
+               ["\tbe, err := h.balancer.Next()"]),
+              ["Token bucket per client in `internal/ratelimit` (default 50 req/s, burst 100)",
+               "Over-limit requests get **429** with `Retry-After`",
+               "Per-client overrides via `rate_limits:` in config", "Idle buckets are evicted after 10 minutes",
+               "Added 5 tests; all packages pass"]),
+            T("health checks should take dead backends out of rotation", "Backend Health Checks", "Healthy",
+              ["Look at how backends are chosen", "Add an active health checker",
+               "Skip unhealthy backends in the balancer", "Add tests", "Run the test suite"],
+              "`Balancer.Next()` does plain round robin and never looks at backend health, so a dead backend "
+              "still gets every Nth request. I'll add a checker that polls `/healthz` and have the balancer "
+              "skip unhealthy ones.",
+              ("internal/proxy/balancer.go", 40, ["func (b *Balancer) Next() (*Backend, error) {"],
+               ["\treturn b.backends[b.idx.Add(1)%n], nil"],
+               ["\tstart := int(b.idx.Add(1))", "\tfor i := 0; i < n; i++ {",
+                "\t\tif be := b.backends[(start+i)%n]; be.Healthy.Load() {", "\t\t\treturn be, nil", "\t\t}",
+                "\t}", "\treturn nil, ErrNoHealthyBackends"], ["}"]),
+              ["New health checker polls `/healthz` every 5s (2 failures to mark down, 2 passes to restore)",
+               "Balancer skips unhealthy backends and returns **503** if none are left",
+               "Health changes are logged with backend ID and reason", "Added 4 tests; all packages pass"],
+              fail=(["--- FAIL: TestBalancer_SkipsUnhealthy (0.01s)",
+                     "    balancer_test.go:58: got backend-1, want backend-2",
+                     "FAIL github.com/acme/{name}/internal/proxy  0.981s", "FAIL"],
+                    "One failure: the balancer still picks a backend in the same tick it's marked down, because "
+                    "the checker writes health to a copy of the slice. I'll store pointers so updates are seen.",
+                    ("internal/proxy/balancer.go", 18, ["type Balancer struct {"], ["\tbackends []Backend"],
+                     ["\tbackends []*Backend"], ["\tidx      atomic.Uint64"]))),
+            T("add graceful shutdown so in flight requests can finish", "Graceful Shutdown", "ListenAndServe",
+              ["Check how the server starts and stops", "Handle SIGINT and SIGTERM",
+               "Drain in-flight requests with a timeout", "Run the test suite"],
+              "`main.go` calls `ListenAndServe` and exits on any signal, cutting off in-flight requests. I'll "
+              "catch SIGTERM, stop accepting new connections and give open requests up to 30s to finish.",
+              ("cmd/gateway/main.go", 52, ["\tsrv := &http.Server{Addr: cfg.Addr, Handler: h}"],
+               ["\tlog.Fatal(srv.ListenAndServe())"],
+               ["\tgo func() {", "\t\tif err := srv.ListenAndServe(); err != http.ErrServerClosed {",
+                "\t\t\tlog.Fatal(err)", "\t\t}", "\t}()", "\t<-ctx.Done()",
+                "\tdone, cancel := context.WithTimeout(context.Background(), 30*time.Second)",
+                "\tdefer cancel()", "\tsrv.Shutdown(done)"], []),
+              ["SIGINT and SIGTERM now trigger a graceful shutdown",
+               "The server stops accepting connections and waits up to 30s for open requests",
+               "Health checker and metrics flush before exit", "All packages pass"]),
+        ]),
+    dict(
+        names=['logsift', 'tracecat', 'grepline', 'jsonpipe', 'tailfish', 'loghound'], dir="src", branches=["main", "feat/json-output", "perf/large-files"],
+        files=["src/main.rs", "src/parser.rs", "src/filter.rs", "src/output.rs", "Cargo.toml"],
+        test="cargo test",
+        passed=["   Compiling {name} v0.4.1 (~/code/{name})",
+                "    Finished `test` profile [unoptimized + debuginfo] in 3.84s",
+                "     Running unittests src/main.rs",
+                "test result: ok. 41 passed; 0 failed; 0 ignored; finished in 0.05s"],
+        test_tpl="tests/{snake}.rs",
+        preview=["use assert_cmd::Command;", "use predicates::prelude::*;", "", "#[test]"],
+        tasks=[
+            T("add a --json flag that outputs matches as json lines", "JSON Output Flag", "struct Args",
+              ["Look at CLI args and output", "Add --json flag", "Add a JsonLines output writer",
+               "Add CLI tests", "Run the test suite"],
+              "Output goes through the `Output` trait in `output.rs`, so I can add a `JsonLines` writer next "
+              "to `Pretty` and choose it from a new `--json` flag.",
+              ("src/main.rs", 14, ["struct Args {", "    pattern: Option<String>,"], [],
+               ["    /// Print matches as JSON lines", "    #[arg(long)]", "    json: bool,"],
+               ["    #[arg(short, long)]"]),
+              ["New `--json` flag prints one JSON object per match (ts, level, msg, fields)",
+               "Added a `JsonLines` writer next to `Pretty` in `output.rs`",
+               "Colors turn off automatically with `--json`", "Added 3 CLI tests; 44 pass"]),
+            T("parsing breaks on multiline stack traces", "Multiline Stack Traces", "fn parse_line",
+              ["Reproduce with a sample Java trace", "Join continuation lines into one record", "Add tests",
+               "Run the test suite"],
+              "`parse_line` treats every line as a new record, so each `at com.foo...` frame shows up as a "
+              "separate unparsed entry. I'll buffer indented continuation lines onto the previous record.",
+              ("src/parser.rs", 66, ["    for line in reader.lines() {", "        let line = line?;"], [],
+               ['        if line.starts_with("    ") {', "            current.push('\\n');",
+                "            current.push_str(line.trim_start());", "            continue;", "        }"],
+               ["        flush(&mut current, &mut out);"]),
+              ["Indented continuation lines are joined onto the previous record",
+               "Stack traces now show up as one match with the full trace",
+               "Added tests with Java and Python traces; 43 pass"],
+              fail=(["test parser::tests::joins_tab_continuation ... FAILED",
+                     "---- parser::tests::joins_tab_continuation stdout ----",
+                     "assertion `left == right` failed: left: 3, right: 2",
+                     "test result: FAILED. 42 passed; 1 failed; 0 ignored"],
+                    "One test fails: tab-indented continuation lines aren't joined, only space-indented ones. "
+                    "I'll treat any leading whitespace as a continuation.",
+                    ("src/parser.rs", 69, [], ['        if line.starts_with("    ") {'],
+                     ["        if line.starts_with(char::is_whitespace) {"],
+                     ["            current.push('\\n');"]))),
+            T("it's really slow on big files, like 2gb logs, speed it up", "Faster Large-file Parsing",
+              "BufReader",
+              ["Profile a 2 GB sample file", "Remove per-line allocations", "Use memchr for line splitting",
+               "Run the test suite"],
+              "Most of the time goes into allocating a new `String` for every line and compiling the regex "
+              "inside the loop. I'll reuse one buffer, hoist the regex out of the loop and split lines with "
+              "`memchr`.",
+              ("src/filter.rs", 23, ["pub fn run(path: &Path, args: &Args) -> Result<()> {"],
+               ["    for line in BufReader::new(File::open(path)?).lines() {",
+                "        let re = Regex::new(&args.pattern)?;"],
+               ["    let re = Regex::new(&args.pattern)?;", "    let mut buf = Vec::with_capacity(64 * 1024);",
+                "    let mut rdr = BufReader::with_capacity(1 << 20, File::open(path)?);",
+                "    while rdr.read_until(b'\\n', &mut buf)? > 0 {"], ["        if re.is_match(&buf) {"]),
+              ["2 GB file: **41.2s → 3.9s** on this machine",
+               "Regex compiled once; one reused line buffer instead of a `String` per line",
+               "1 MB read buffer and `memchr` for line splitting", "All 41 tests pass"]),
+        ]),
+    dict(
+        names=['habitly', 'streaks-ios', 'focusly', 'moodlog', 'sipwater', 'pagetrack'], dir="Habitly", branches=["main", "feature/streaks", "fix/midnight-reset"],
+        files=["Habitly/Views/HabitListView.swift", "Habitly/Models/Habit.swift",
+               "Habitly/Stores/HabitStore.swift", "Habitly/Views/HabitRow.swift",
+               "HabitlyTests/HabitStoreTests.swift"],
+        test="xcodebuild test -scheme Habitly -quiet",
+        passed=["Test Suite 'HabitStoreTests' passed.", "\t Executed 22 tests, with 0 failures in 1.553 seconds",
+                "Test Suite 'StreakTests' passed.", "\t Executed 9 tests, with 0 failures in 0.412 seconds",
+                "** TEST SUCCEEDED **"],
+        test_tpl="HabitlyTests/{pascal}Tests.swift",
+        preview=["import XCTest", "@testable import Habitly", "", "final class {pascal}Tests: XCTestCase {"],
+        tasks=[
+            T("add a streak counter badge to each habit row", "Streak Badge", "struct HabitRow",
+              ["Look at the Habit model and row view", "Compute current streak in the model",
+               "Add StreakBadge view to HabitRow", "Add tests", "Run the test suite"],
+              "`Habit` already stores `completions: [Date]`, so the streak can be computed. I'll add "
+              "`currentStreak` to the model and a small flame badge to `HabitRow` that shows for streaks of "
+              "2 or more.",
+              ("Habitly/Views/HabitRow.swift", 21, ["        HStack {", "            Text(habit.name)"], [],
+               ["            Spacer()", "            if habit.currentStreak > 1 {",
+                "                StreakBadge(count: habit.currentStreak)", "            }"],
+               ["            CheckButton(done: habit.isDoneToday)"]),
+              ["`Habit.currentStreak` counts consecutive days ending today or yesterday",
+               "New `StreakBadge` (flame + count) in each row, hidden under 2 days",
+               "Badge animates when the streak goes up", "Added 6 tests; 37 pass"]),
+            T("habits reset at midnight UTC instead of my local time", "Local Midnight Reset", "isDoneToday",
+              ["Find where the day boundary is computed", "Switch to the user's calendar and time zone",
+               "Add tests across time zones", "Run the test suite"],
+              "`isDoneToday` compares dates with a fixed UTC `DateFormatter`, so for you the day rolls over in "
+              "the afternoon. I'll use `Calendar.isDateInToday` with the current time zone.",
+              ("Habitly/Models/Habit.swift", 33, ["    var isDoneToday: Bool {"],
+               ["        let fmt = DateFormatter.utcDay",
+                "        return completions.contains { fmt.string(from: $0) == fmt.string(from: .now) }"],
+               ["        completions.contains { Calendar.current.isDateInToday($0) }"], ["    }"]),
+              ["Day boundaries now use your local calendar and time zone",
+               "Removed the UTC `DateFormatter` from streak and today checks",
+               "Added tests for UTC-8, UTC+9 and DST changes; 34 pass"],
+              fail=(["HabitStoreTests.swift:84: error: testResetUsesLocalMidnight",
+                     '  XCTAssertEqual failed: ("3") is not equal to ("4")',
+                     "\t Executed 25 tests, with 1 failure in 1.601 seconds", "** TEST FAILED **"],
+                    "One failure: the test still runs in UTC because the calendar isn't injected. I'll pass a "
+                    "`Calendar` into `HabitStore` so tests can pin a time zone.",
+                    ("Habitly/Stores/HabitStore.swift", 18, [], ["    private let calendar = Calendar.current"],
+                     ["    private let calendar: Calendar", "", "    init(calendar: Calendar = .current) {",
+                      "        self.calendar = calendar", "    }"], []))),
+            T("add swipe to archive on the habit list", "Swipe to Archive", "ForEach(store",
+              ["Look at HabitListView and the store", "Add archived flag and store method",
+               "Add swipe action with undo", "Add tests", "Run the test suite"],
+              "`HabitListView` uses a plain `List` with no swipe actions. I'll add an `isArchived` flag, filter "
+              "archived habits out of the list and add a trailing swipe with an undo toast.",
+              ("Habitly/Views/HabitListView.swift", 27,
+               ["            ForEach(store.active) { habit in", "                HabitRow(habit: habit)"], [],
+               ["                    .swipeActions(edge: .trailing) {",
+                '                        Button("Archive", systemImage: "archivebox") {',
+                "                            store.archive(habit)", "                        }",
+                "                        .tint(.indigo)", "                    }"], ["            }"]),
+              ["Trailing swipe archives a habit, with a 4s undo toast",
+               "Archived habits are hidden from the list and kept for stats",
+               "Added `HabitStore.archive(_:)` and `unarchive(_:)`", "Added 3 tests; 34 pass"]),
+        ]),
+]
+
+
+def vlen(s):
+    return len(ANSI.sub("", s))
+
+
+def pad(s, w):
+    return s + " " * max(0, w - vlen(s))
+
+
+def clip(s, w):
+    out, n, i = [], 0, 0
+    while i < len(s):
+        m = ANSI.match(s, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        if n >= w:
+            break
+        out.append(s[i])
+        n += 1
+        i += 1
+    return "".join(out)
+
+
+def inline(text, st):
+    # `code` and **bold**; st carries open spans across wrapped lines
+    out = []
+    for part in re.split(r"(`|\*\*)", text):
+        if part == "`":
+            st[0] = not st[0]
+        elif part == "**":
+            st[1] = not st[1]
+        elif part:
+            out.append((CODE if st[0] else "") + (BOLD if st[1] else "") + part + R)
+    return "".join(out)
+
+
+def code_line(n, sign, code, shade=""):
+    code = code.expandtabs(4)
+    if shade:
+        return lambda w: shade + pad(f"{n:>4} {sign} {code}", w - 5) + R
+    return lambda w: f"{GREY}{n:>4}{R}   {code}"
+
+
+def dur(s):
+    s = int(s)
+    return f"{s}s" if s < 60 else f"{s // 60}m {s % 60}s"
+
+
+def tok(n):
+    return str(int(n)) if n < 1000 else f"{n / 1000:.1f}k"
+
+
+def set_title(t):
+    sys.stdout.buffer.write(f"\x1b]0;✳ {t}\x07".encode())
+
+
+class Item:
+    attached = False  # drawn right under the previous item, without a blank line
+
+
+class Header(Item):
+    def __init__(self, path):
+        self.path = path
+
+    def lines(self, w):
+        blk = bg(215, 119, 87)
+        return ["",
+                f"{ORANGE}▗{blk}\x1b[38;2;0;0;0m ▗   ▖ {R}{ORANGE}▖{R}  {BOLD}Claude Code{R} {GREY}v{VERSION}{R}",
+                f" {blk}       {R}   {GREY}{MODEL} with {EFFORT} effort · {PLAN}{R}",
+                f" {ORANGE}▘▘   ▝▝{R}   {GREY}{self.path}{R}"]
+
+
+class Note(Item):
+    def __init__(self, text, attached=False):
+        self.text, self.attached = text, attached
+
+    def lines(self, w):
+        return [self.text]
+
+
+class UserMsg(Item):
+    def __init__(self, text):
+        self.text = text
+
+    def lines(self, w):
+        rows = textwrap.wrap(self.text, max(10, w - 3)) or [""]
+        return [USER_BG + pad(f"{GREY}{'❯' if i == 0 else ' '}{NBSP}\x1b[39m{r}", w) + R
+                for i, r in enumerate(rows)]
+
+
+class Text(Item):
+    def __init__(self, text):
+        self.text, self.shown = text, 0
+
+    def lines(self, w):
+        out, st = [], [False, False]
+        for para in self.text[:self.shown].split("\n"):
+            bullet = para.startswith("- ")
+            body = para[2:] if bullet else para
+            for j, row in enumerate(textwrap.wrap(body, max(10, w - (4 if bullet else 2))) or [""]):
+                if bullet:
+                    pre = "  - " if j == 0 else "    "
+                else:
+                    pre = "⏺ " if not out else "  "
+                out.append(pre + inline(row, st))
+        return out
+
+
+class Tool(Item):
+    def __init__(self, name, arg=None, body=None, state="run"):
+        self.name, self.arg, self.body, self.state = name, arg, body or [], state
+
+    def lines(self, w):
+        if self.state == "run":
+            dot = GREY + "⏺" + R if int(time.time() * 2.5) % 2 == 0 else " "
+        else:
+            dot = (OK if self.state == "ok" else ERR) + "⏺" + R
+        out = [f"{dot} {BOLD}{self.name}{R}" + (f"({self.arg})" if self.arg else "")]
+        for i, b in enumerate(self.body):
+            out.append((f"  {GREY}⎿{R}  " if i == 0 else "     ") + (b(w) if callable(b) else b))
+        return out
+
+
+class Quit(Exception):
+    pass
+
+
+class Session:
+    def __init__(self, proj, name, manual):
+        self.p, self.name, self.manual = proj, name, manual
+        self.path = f"{HOME}/code/{name}"
+        self.items = [Header(self.path)]
+        self.branch = random.choice(proj["branches"])
+        self.placeholder = random.choice(PLACEHOLDERS)
+        self.input, self.queue, self.deck = "", [], []
+        self.busy, self.gen, self.wake = False, None, 0.0
+        self.verb, self.tokens, self.tok_rate, self.turn_start = "", 0.0, 0.0, 0.0
+        self.auto, self.auto_at = None, time.time() + random.uniform(1.5, 10)  # panes start out of step
+        self.ctrlc_at = 0.0
+        self.ctx, self.five = random.randint(3, 14), random.randint(8, 55)
+
+    # ---- the scripted work -------------------------------------------------
+
+    def next_task(self):
+        if not self.deck:
+            self.deck = random.sample(self.p["tasks"], len(self.p["tasks"]))
+        return self.deck.pop()
+
+    def custom(self, text):
+        base = random.choice(self.p["tasks"])
+        f = base["diff"][0]
+        return T(text, " ".join(text.split()[:4]).title() or "Task", base["grep"], GENERIC_TODOS,
+                 f"The relevant logic is in `{f}`. I'll make the change there and add tests for it.",
+                 base["diff"], [f"Updated `{f}`", "Added tests for the new behavior", "Full test suite passes"])
+
+    def think(self, lo, hi):
+        self.tok_rate = random.uniform(20, 60)
+        yield random.uniform(lo, hi)
+
+    def say(self, text):
+        t = Text(text)
+        self.items.append(t)
+        self.tok_rate = random.uniform(60, 120)
+        while t.shown < len(text):
+            t.shown += random.randint(4, 18)
+            yield random.uniform(0.03, 0.07)
+        yield random.uniform(0.4, 1.0)
+
+    def tool(self, name, arg, body, secs):
+        t = Tool(name, arg)
+        self.items.append(t)
+        self.tok_rate = random.uniform(10, 30)
+        yield secs
+        t.body, t.state = body, "ok"
+        yield random.uniform(0.3, 0.9)
+
+    def todos(self, todos, done):
+        body = []
+        for i, t in enumerate(todos):
+            if i < done:
+                body.append(f"{GREY}{STRIKE}☒ {t}{R}")
+            elif i == done:
+                body.append(f"{BOLD}☐ {t}{R}")
+            else:
+                body.append(f"☐ {t}")
+        self.items.append(Tool("Update Todos", body=body, state="ok"))
+        yield random.uniform(0.5, 1.2)
+
+    def edit(self, diff):
+        path, n, before, minus, plus, after = diff
+        head = f"{GREY}Updated {BOLD}{path}{R}{GREY} with {len(plus)} addition{'s' * (len(plus) != 1)}"
+        if minus:
+            head += f" and {len(minus)} removal{'s' * (len(minus) != 1)}"
+        body = [head + R]
+        for c in before:
+            body.append(code_line(n, " ", c))
+            n += 1
+        body += [code_line(n + k, "-", c, DEL_BG) for k, c in enumerate(minus)]
+        for k, c in enumerate(plus + after):
+            added = k < len(plus)
+            body.append(code_line(n, "+" if added else " ", c, ADD_BG if added else ""))
+            n += 1
+        yield from self.tool("Update", path, body, random.uniform(1, 2.6))
+
+    def write_tests(self, task):
+        words = re.findall(r"[A-Za-z0-9]+", task["title"])
+        names = {"{slug}": "-".join(w.lower() for w in words), "{snake}": "_".join(w.lower() for w in words),
+                 "{pascal}": "".join(w[:1].upper() + w[1:] for w in words)}
+
+        def fill(s):
+            for k, v in names.items():
+                s = s.replace(k, v)
+            return s
+
+        path, total = fill(self.p["test_tpl"]), random.randint(28, 96)
+        preview = [fill(l) for l in self.p["preview"]]
+        body = ([f"{GREY}Wrote {total} lines to {BOLD}{path}{R}"]
+                + [code_line(i + 1, " ", l) for i, l in enumerate(preview)]
+                + [f"{GREY}… +{total - len(preview)} lines (ctrl+o to expand){R}"])
+        yield from self.tool("Write", path, body, random.uniform(1.5, 3.5))
+
+    def bash(self, output, failed=False):
+        t = Tool("Bash", self.p["test"])
+        self.items.append(t)
+        self.tok_rate = random.uniform(5, 15)
+        yield random.uniform(2.5, 6.5)
+        t.body = (([f"{ERR}Error: Exit code 1{R}"] if failed else [])
+                  + [l.replace("{name}", self.name).expandtabs(4) for l in output]
+                  + [f"{GREY}… +{random.randint(4, 30)} lines (ctrl+o to expand){R}"])
+        t.state = "err" if failed else "ok"
+        yield random.uniform(0.4, 1.0)
+
+    def agent(self, task):
+        a = Tool("Explore", f"Find code for {task['title'].lower()}")
+        self.items.append(a)
+        start, ext = time.time(), task["diff"][0].rsplit(".", 1)[-1]
+        uses = random.randint(5, 12)
+        for n in range(1, uses + 1):
+            cur = random.choice([f"Read({random.choice(self.p['files'])})", f'Search(pattern: "{task["grep"]}")',
+                                 f'Glob(pattern: "**/*.{ext}")'])
+            a.body = [f"{GREY}{cur}{R}"] + ([f"{GREY}+{n - 1} more tool uses (ctrl+o to expand){R}"] if n > 1 else [])
+            self.tok_rate = random.uniform(150, 400)
+            yield random.uniform(0.6, 1.6)
+        a.state = "ok"
+        a.body = [f"{GREY}Done ({uses} tool uses · {random.uniform(14, 48):.1f}k tokens · "
+                  f"{dur(time.time() - start)}){R}"]
+        yield random.uniform(0.4, 0.9)
+
+    def turn(self, text, task):
+        if self.ctx >= 85:
+            verb, self.verb, self.tok_rate = self.verb, "Compacting conversation", random.uniform(200, 400)
+            yield random.uniform(4, 8)
+            self.items = [Header(self.path), Note(f"{GREY}✻ Conversation compacted (ctrl+o for history){R}")]
+            self.ctx, self.verb = random.randint(12, 20), verb
+        self.items.append(UserMsg(text))
+        yield from self.think(1.2, 3.5)
+        if random.random() < 0.5:
+            self.items.append(Note(f"{GREY}{ITAL}∴ Thought for {random.randint(2, 9)}s (ctrl+o to show thinking){R}"))
+            yield random.uniform(0.3, 0.8)
+        yield from self.say(random.choice(INTROS))
+        todos, path = task["todos"], task["diff"][0]
+        yield from self.todos(todos, 0)
+        if random.random() < 0.35:
+            yield from self.agent(task)
+        else:
+            found = random.randint(2, 9)
+            yield from self.tool("Search", f'pattern: "{task["grep"]}", path: "{self.p["dir"]}"',
+                                 [f"{GREY}Found {found} files (ctrl+o to expand){R}"], random.uniform(0.6, 1.6))
+            others = [f for f in self.p["files"] if f != path]
+            for f in [path] + random.sample(others, random.randint(0, 2)):
+                yield from self.tool("Read", f, [f"{GREY}Read {random.randint(40, 480)} lines{R}"],
+                                     random.uniform(0.5, 1.4))
+        yield from self.think(1, 3.5)
+        yield from self.say(task["find"])
+        yield from self.todos(todos, 1)
+        yield from self.edit(task["diff"])
+        tests_at = next((i for i, t in enumerate(todos) if t.startswith("Add") and "test" in t), None)
+        if tests_at is not None:
+            yield from self.todos(todos, tests_at)
+            yield from self.write_tests(task)
+        yield from self.todos(todos, len(todos) - 1)
+        if task["fail"] and random.random() < 0.6:
+            output, why, fix = task["fail"]
+            yield from self.bash(output, failed=True)
+            yield from self.think(1, 2.5)
+            yield from self.say(why)
+            yield from self.edit(fix)
+        yield from self.bash(self.p["passed"])
+        yield from self.todos(todos, len(todos))
+        yield from self.think(0.8, 2)
+        yield from self.say(random.choice(LEADS) + "\n\n" + "\n".join("- " + s for s in task["summary"]))
+
+    # ---- session control -----------------------------------------------------
+
+    def start(self, text, task=None):
+        task = task or self.custom(text)
+        self.busy, self.turn_start, self.tokens = True, time.time(), 0.0
+        self.verb = random.choice(VERBS)
+        set_title(task["title"])
+        self.gen, self.wake = self.turn(text, task), time.time()
+
+    def finish(self, now):
+        self.busy, self.gen = False, None
+        self.items.append(Note(f"{GREY}✻ {random.choice(PAST)} for {dur(now - self.turn_start)}{R}"))
+        self.items = self.items[-150:]
+        self.ctx = min(99, self.ctx + random.randint(5, 13))
+        self.five = min(99, self.five + random.randint(1, 3))
+        self.auto_at = now + random.uniform(4, 14)
+
+    def interrupt(self):
+        self.gen.close()
+        self.busy, self.gen = False, None
+        for it in self.items:
+            if isinstance(it, Tool) and it.state == "run":
+                it.state = "err"
+        self.items.append(Note(f"  {GREY}⎿  {ERR}Interrupted{GREY} · What should Claude do instead?{R}",
+                               attached=True))
+        self.auto_at = time.time() + random.uniform(6, 15)
+
+    def submit(self):
+        text, self.input = self.input.strip(), ""
+        if not text:
+            return
+        if self.busy:
+            self.queue.append(text)
+        else:
+            self.start(text)
+
+    def on_input(self, data):
+        if data == b"\x1b":
+            if self.busy:
+                self.interrupt()
+            return
+        if data.startswith(b"\x1b"):
+            return  # arrow keys, scroll and other escape sequences
+        for ch in data.decode("utf-8", "ignore"):
+            if ch == "\x03":
+                now = time.time()
+                if self.input:
+                    self.input, self.auto = "", None
+                elif self.busy:
+                    self.interrupt()
+                elif now - self.ctrlc_at < 2:
+                    raise Quit
+                else:
+                    self.ctrlc_at = now
+            elif ch in "\r\n":
+                self.auto = None
+                self.submit()
+            elif ch in "\x7f\x08":
+                self.input = self.input[:-1]
+            elif ch == "\x15":
+                self.input = ""
+            elif ch >= " ":
+                if self.auto:  # you started typing: drop whatever autopilot was typing
+                    self.auto, self.input = None, ""
+                self.input += ch
+                self.auto_at = time.time() + random.uniform(10, 20)
+
+    def tick(self, now, dt):
+        if self.busy:
+            self.tokens += self.tok_rate * dt
+            if now >= self.wake:
+                try:
+                    self.wake = now + next(self.gen) / SPEED
+                except StopIteration:
+                    self.finish(now)
+            return
+        if self.queue:
+            self.start(self.queue.pop(0))
+        elif self.auto:
+            if now < self.auto_at:
+                return
+            text, i, task = self.auto
+            if i < len(text):
+                self.input += text[i]
+                pause = random.random() < 0.06
+                self.auto_at = now + (random.uniform(0.25, 0.6) if pause else random.uniform(0.03, 0.11)) / SPEED
+            elif i == len(text):
+                self.auto_at = now + random.uniform(0.4, 1.2) / SPEED
+            else:
+                self.auto, self.input = None, ""
+                self.start(text, task)
+                return
+            self.auto[1] += 1
+        elif not self.manual and not self.input and now >= self.auto_at:
+            task = self.next_task()
+            self.auto, self.auto_at = [task["prompt"], 0, task], now
+
+    # ---- drawing ---------------------------------------------------------------
+
+    def spinner(self, now, cols):
+        g = GLYPHS[int(now * 8) % len(GLYPHS)]
+        word = self.verb + "…"
+        p = int(now * 14) % (len(word) + 8) - 4
+        shimmer = "".join((ORANGE_HI if abs(i - p) <= 1 else ORANGE) + c for i, c in enumerate(word))
+        # narrow panes drop the hint first, then the token count, then the timer
+        parts = [dur(now - self.turn_start), f"↓ {tok(self.tokens)} tokens", "esc to interrupt"]
+        while parts and len(word) + 5 + len(" · ".join(parts)) > cols:
+            parts.pop()
+        extra = f" {GREY}({' · '.join(parts)}){R}" if parts else ""
+        return f"{ORANGE}{g}{R} {shimmer}{R}{extra}"
+
+    def status(self, cols):
+        def color(v):
+            return "\x1b[31m" if v >= 80 else "\x1b[33m" if v >= 50 else "\x1b[32m"
+        sep = f"{DIM} │ \x1b[22m"
+        filled = min(10, self.ctx // 10)
+        bar = "▓" * filled + "░" * (10 - filled)
+        line = f"   \x1b[36m{MODEL}{GREY}"
+        # narrow panes drop whole sections from the end rather than cutting one off
+        for part in [self.name, f"\x1b[35m⎇ {self.branch}{GREY}", f"ctx {color(self.ctx)}{bar} {self.ctx}%{GREY}",
+                     f"5h {color(self.five)}{self.five}%{GREY}"]:
+            if vlen(line + sep + part) > cols:
+                break
+            line += sep + part
+        return line + R
+
+    def draw(self, now):
+        try:
+            cols, rows = os.get_terminal_size(sys.stdout.fileno())
+        except OSError:
+            cols, rows = 80, 24
+        left = self.spinner(now, cols) if self.busy else ""
+        right = f"{GREY}◉ {EFFORT} · /effort{R}"
+        gap = cols - vlen(left) - vlen(right) - 2
+        if self.input:
+            typed = textwrap.wrap(self.input, max(10, cols - 2), drop_whitespace=False) or [""]
+        else:
+            typed = [""] if self.busy else [f"{DIM}{self.placeholder}{R}"]
+        prompt = [("❯" if i == 0 else " ") + NBSP + row for i, row in enumerate(typed)]
+        if now - self.ctrlc_at < 2:
+            mode = f"  {GREY}Press Ctrl-C again to exit{R}"
+        else:
+            mode = f"  {AMBER}⏵⏵ auto mode on{GREY} (shift+tab to cycle){R}"
+        rule = RULE + "─" * cols + R
+        # short panes (big grids) keep only what's needed so most of the pane is activity
+        full = rows >= 18
+        if not full and now - self.ctrlc_at < 2:
+            spin_row = mode  # no mode line in compact panes, so the exit hint goes here
+        else:
+            spin_row = left + " " * gap + right if gap > 0 else left
+        top = ([""] if full else []) + [f"{GREY}❯ {q}{R}" for q in self.queue] + [spin_row, rule]
+        if full:
+            tail = [rule, self.status(cols), mode]
+        elif rows >= 12:
+            tail = [rule, self.status(cols)]
+        else:
+            tail = []
+        bottom = top + prompt + tail
+
+        avail = max(0, rows - len(bottom))
+        body = []
+        for it in self.items:
+            ls = it.lines(cols)
+            if body and ls and not it.attached:
+                body.append("")
+            body.extend(ls)
+        body = body[-avail:] if avail else []
+        screen = body + [""] * (avail - len(body)) + bottom
+
+        out = ["\x1b[?2026h\x1b[?25l"]  # synchronized output: the terminal shows the frame all at once
+        for i, line in enumerate(screen[:rows]):
+            out.append(f"\x1b[{i + 1};1H{clip(line, cols)}{R}\x1b[K")
+        cursor_row = avail + len(top) + len(prompt)
+        cursor_col = 3 + (len(typed[-1]) if self.input else 0)
+        out.append(f"\x1b[{min(cursor_row, rows)};{min(cursor_col, cols)}H\x1b[?25h\x1b[?2026l")
+        sys.stdout.buffer.write("".join(out).encode())
+        sys.stdout.buffer.flush()
+
+    def run(self, fd):
+        last = last_draw = time.time()
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0.03)
+            if ready:
+                self.on_input(os.read(fd, 1024))
+            now = time.time()
+            self.tick(now, now - last)
+            last = now
+            if now - last_draw >= 0.07:
+                self.draw(now)
+                last_draw = now
+
+
+def main():
+    args, project, manual = sys.argv[1:], None, False
+    while args:
+        a = args.pop(0)
+        if a == "--project" and args:
+            project = int(args.pop(0))
+        elif a == "--manual":
+            manual = True
+        else:
+            print(__doc__.strip())
+            return
+    if project is None:
+        project = random.randrange(len(PROJECTS) * 6)
+    # panes 0-5 get one project each; past that the same projects come back under other repo names
+    proj = PROJECTS[project % len(PROJECTS)]
+    name = proj["names"][project // len(PROJECTS) % len(proj["names"])]
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
+    try:
+        tty.setraw(fd)
+        sys.stdout.buffer.write(b"\x1b[?1049h\x1b[2J")
+        set_title("Claude Code")
+        Session(proj, name, manual).run(fd)
+    except (Quit, KeyboardInterrupt):
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.buffer.write(b"\x1b[?25h\x1b[?1049l")
+        sys.stdout.buffer.flush()
+
+
+if __name__ == "__main__":
+    main()
