@@ -4,8 +4,7 @@
 
 **A wall of Claude Code sessions, all hard at work. None of it is real.**
 
-`fake-claude` fills a Ghostty window with up to 64 terminals that look exactly like Claude Code grinding through tasks:<br>
-reading files, writing diffs, running tests, ticking off todos. It's all scripted: no API, no tokens, no network.
+`fake-claude` fills a Ghostty window with up to 64 terminals that look exactly like Claude Code grinding through tasks: reading files, writing diffs, running tests, ticking off todos. It's all scripted: no API, no tokens, no network.
 
 <img src="docs/grid.png" alt="Six fake Claude Code sessions working side by side in a 3 by 2 Ghostty grid" width="100%">
 
